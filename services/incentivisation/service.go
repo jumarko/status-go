@@ -3,6 +3,8 @@ package incentivisation
 import (
 	"bytes"
 	"context"
+	"errors"
+
 	"crypto/ecdsa"
 	"encoding/binary"
 	"encoding/hex"
@@ -26,7 +28,7 @@ import (
 
 const (
 	gasLimit              = 1001000
-	pingIntervalAllowance = 120
+	pingIntervalAllowance = 240
 	tickerInterval        = 30
 	defaultTopic          = "status-incentivisation-topic"
 )
@@ -151,24 +153,33 @@ func (s *Service) newSession() (bool, error) {
 func (s *Service) CheckPings() map[string]bool {
 	result := make(map[string]bool)
 	now := time.Now().Unix()
+	s.log.Info("checking votes", "votes", s.whisperPings)
 	for enodeID, timestamps := range s.whisperPings {
+		result[enodeID] = true
+
 		if len(timestamps) < 2 {
 			s.log.Info("Node failed check", "enodeID", enodeID)
 			result[enodeID] = false
 			continue
 		}
+
 		sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
 		timestamps = append(timestamps, uint32(now))
 		for i := 1; i < len(timestamps); i++ {
-			if timestamps[i]-timestamps[i-1] < pingIntervalAllowance {
-				s.log.Info("Node failed check", "enodeID", enodeID)
+			s.log.Info("Diff", "t1", timestamps[i], "t2", timestamps[i-1], "t1-t2", timestamps[i]-timestamps[i-1])
+
+			if timestamps[i]-timestamps[i-1] > pingIntervalAllowance {
 				result[enodeID] = false
-				continue
 			}
 		}
+		if result[enodeID] {
+			s.log.Info("Node passed check", "enodeID", enodeID)
+		} else {
+			s.log.Info("Node failed check", "enodeID", enodeID)
+		}
 
-		s.log.Info("Node passed check", "enodeID", enodeID)
 	}
+	s.log.Info("voting result", "result", result)
 	return result
 }
 
@@ -196,20 +207,68 @@ func (s *Service) perform() error {
 		return err
 	}
 
+	// This actually updates the session
 	newSession, err := s.newSession()
 	if err != nil {
 		s.log.Error("Could not check session", "err", err)
 		return err
 	}
 
-	if newSession {
-		s.log.Info("NEW SESSION")
+	if !newSession {
+		s.log.Info("Not a new session idling")
 		return nil
 	}
-	s.CheckPings()
-	s.log.Info("OLD SESSION")
+
+	result := s.CheckPings()
+	err = s.vote(result)
+	if err != nil {
+		s.log.Error("Could not vote", "err", err)
+		return err
+	}
+
+	// Reset whisper pings
+	s.whisperPings = make(map[string][]uint32)
 
 	return nil
+}
+
+func (s *Service) vote(result map[string]bool) error {
+	var behavingNodes []gethcommon.Address
+	var misbehavingNodes []gethcommon.Address
+	auth := s.auth()
+
+	for enodeIDString, passedCheck := range result {
+		enodeID, err := hex.DecodeString(enodeIDString)
+		if err != nil {
+			return err
+		}
+		if passedCheck {
+			behavingNodes = append(behavingNodes, publicKeyBytesToAddress(enodeID))
+		} else {
+			misbehavingNodes = append(misbehavingNodes, publicKeyBytesToAddress(enodeID))
+		}
+	}
+
+	tx, err := s.contract.Vote(&bind.TransactOpts{
+		GasLimit: gasLimit,
+		From:     auth.From,
+		Signer:   auth.Signer,
+	}, behavingNodes, misbehavingNodes)
+	client, err := s.client()
+	for true {
+		receipt, _ := client.TransactionReceipt(context.TODO(), tx.Hash())
+		if receipt != nil {
+			if receipt.Status == 0 {
+				s.log.Info("Receipt returned 0 status")
+				return errors.New("Receipt invalid")
+			} else {
+				s.log.Info("Receipt returned non-zero status", "status", receipt.Status)
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return err
 }
 
 func (s *Service) startTicker() {
@@ -240,7 +299,8 @@ func (s *Service) Start(server *p2p.Server) error {
 		return err
 	}
 	s.contract = contract
-	s.log.Info("Incentivisation service started")
+
+	s.log.Info("Incentivisation service started 2", "address", s.addressString(), "publickey", s.publicKeyString())
 	s.startTicker()
 
 	session, err := s.GetCurrentSession()
@@ -337,6 +397,25 @@ func (s *Service) FetchEnodes() error {
 		return err
 	}
 	s.log.Info("fetched node count", "count", activeNodeCount)
+	for i := big.NewInt(0); i.Cmp(activeNodeCount) < 0; i.Add(i, one) {
+		publicKey, ip, port, joiningSession, activeSession, err := s.contract.GetNode(nil, i)
+		if err != nil {
+			return err
+		}
+
+		node := &Enode{
+			PublicKey:      publicKey,
+			IP:             int2ip(ip),
+			Port:           port,
+			JoiningSession: joiningSession,
+			ActiveSession:  activeSession,
+		}
+
+		s.log.Info("adding node", "node", node.toEnodeURL())
+		if node.PublicKeyString() != s.publicKeyString() {
+			s.nodes[node.PublicKeyString()] = node
+		}
+	}
 
 	inactiveNodeCount, err := s.contract.InactiveNodeCount(nil)
 	if err != nil {
@@ -358,11 +437,26 @@ func (s *Service) FetchEnodes() error {
 		}
 
 		s.log.Info("adding node", "node", node.toEnodeURL())
-		s.nodes[node.PublicKeyString()] = node
+		if node.PublicKeyString() != s.publicKeyString() {
+			s.nodes[node.PublicKeyString()] = node
+		}
 	}
 
 	return nil
 
+}
+
+func (s *Service) publicKeyString() string {
+	return hex.EncodeToString(s.publicKeyBytes())
+}
+
+func (s *Service) addressString() string {
+	buf := crypto.Keccak256Hash(s.publicKeyBytes())
+	address := buf[12:]
+
+	return hex.EncodeToString(address)
+
+	return hex.EncodeToString(s.publicKeyBytes())
 }
 
 func (s *Service) PostPing() (hexutil.Bytes, error) {
@@ -370,8 +464,7 @@ func (s *Service) PostPing() (hexutil.Bytes, error) {
 
 	msg.Topic = toWhisperTopic(defaultTopic)
 
-	publicKeyString := hex.EncodeToString(s.publicKeyBytes())
-	enodeURL := formatEnodeURL(publicKeyString, s.config.IP, s.config.Port)
+	enodeURL := formatEnodeURL(s.publicKeyString(), s.config.IP, s.config.Port)
 	payload, err := EncodeMessage(enodeURL, defaultTopic)
 	if err != nil {
 		return nil, err
@@ -426,4 +519,11 @@ func int2ip(nn uint32) net.IP {
 	ip := make(net.IP, 4)
 	binary.BigEndian.PutUint32(ip, nn)
 	return ip
+}
+
+func publicKeyBytesToAddress(publicKey []byte) gethcommon.Address {
+	buf := crypto.Keccak256Hash(publicKey)
+	address := buf[12:]
+
+	return gethcommon.HexToAddress(hex.EncodeToString(address))
 }
